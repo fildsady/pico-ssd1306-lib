@@ -19,6 +19,7 @@
 #include "task.h"
 #include "u8g2.h"
 #include "u8g2_pico_hal.h"
+#include "ssd1306.h" /* ssd1306_init() brings up the shared I2C/DMA driver u8g2's HAL uses */
 
 typedef struct {
     const char *name;
@@ -60,6 +61,8 @@ static int verify_font(u8g2_t *u8g2, const uint8_t *font) {
 
 static void task_u8g2_font_verify(void *pv) {
     (void)pv;
+
+    ssd1306_init(); /* brings up the shared I2C/DMA driver u8g2's HAL sends through */
 
     u8g2_t u8g2;
     u8g2_Setup_ssd1306_i2c_128x64_noname_f(&u8g2, U8G2_R0,

@@ -32,17 +32,6 @@ static void send_cmds(const uint8_t *buf, size_t len)
     i2c_write_blocking(OLED_I2C_PORT, OLED_I2C_ADDR, buf, len, false);
 }
 
-/* Build IC_DATA_CMD word array from pixel buffer.
- * First word = ctrl byte 0x40 (no STOP).
- * Last word  = last pixel | (1<<9) STOP. */
-static void build_cmd_buf(const uint8_t *pixels)
-{
-    s_cmd_buf[0] = 0x40u;
-    for (int i = 0; i < SSD1306_BUF_SIZE - 1; i++)
-        s_cmd_buf[1 + i] = pixels[i];
-    s_cmd_buf[SSD1306_BUF_SIZE] = (uint32_t)pixels[SSD1306_BUF_SIZE - 1] | (1u << 9);
-}
-
 /* ── DMA completion ISR ──────────────────────────────────────────────────── */
 
 static void dma_irq_handler(void)
@@ -139,16 +128,39 @@ bool ssd1306_busy(void) { return s_busy; }
  *
  * During the 23ms DMA phase, all other tasks run normally.
  * ─────────────────────────────────────────────────────────────────────── */
-void ssd1306_update(void)
+/* Shared sender — see doc comment in ssd1306.h. This is the ONLY code path
+ * that touches s_dma_ch/s_done/the I2C enable/tar registers for a DMA
+ * transfer; ssd1306_update() and any other renderer (u8g2's HAL) funnel
+ * through here so there's exactly one owner of the hardware. */
+void ssd1306_i2c_send_dma(const uint8_t *data, size_t len)
 {
-    /* Wait for previous frame's DMA to finish */
+    if (len == 0 || len > 1 + SSD1306_BUF_SIZE) return;
+
+    /* Wait for previous transfer's DMA to finish */
     xSemaphoreTake(s_done, pdMS_TO_TICKS(100));
 
-    /* Ensure I2C master is fully idle before touching it.
-     * At 30fps this is instant — FIFO drains in <1ms, we arrive 10ms later. */
+    /* Ensure I2C master is fully idle before touching it. */
     while (i2c_get_hw(OLED_I2C_PORT)->status & I2C_IC_STATUS_MST_ACTIVITY_BITS)
         tight_loop_contents();
 
+    for (size_t i = 0; i < len; i++)
+        s_cmd_buf[i] = data[i];
+    s_cmd_buf[len - 1] |= (1u << 9);   /* STOP on last byte */
+
+    /* Set up I2C for new transaction (same address, just re-arm) */
+    i2c_get_hw(OLED_I2C_PORT)->enable = 0;
+    i2c_get_hw(OLED_I2C_PORT)->tar    = OLED_I2C_ADDR;
+    i2c_get_hw(OLED_I2C_PORT)->enable = 1;
+
+    /* Start DMA — I2C controller issues START automatically when FIFO fills */
+    s_busy = true;
+    dma_channel_set_read_addr (s_dma_ch, s_cmd_buf, false);
+    dma_channel_set_trans_count(s_dma_ch, len, true);  /* true = trigger */
+    /* returns immediately — caller can continue while DMA runs */
+}
+
+void ssd1306_update(void)
+{
     /* Swap: front_buf ← newly drawn frame (DMA reads)
      *       back_buf  ← old front (task draws next frame here) */
     uint8_t *tmp = front_buf;
@@ -162,19 +174,11 @@ void ssd1306_update(void)
     };
     send_cmds(addr_win, sizeof(addr_win));
 
-    /* Build IC_DATA_CMD word buffer from front_buf */
-    build_cmd_buf(front_buf);
-
-    /* Set up I2C for new transaction (same address, just re-arm) */
-    i2c_get_hw(OLED_I2C_PORT)->enable = 0;
-    i2c_get_hw(OLED_I2C_PORT)->tar    = OLED_I2C_ADDR;
-    i2c_get_hw(OLED_I2C_PORT)->enable = 1;
-
-    /* Start DMA — I2C controller issues START automatically when FIFO fills */
-    s_busy = true;
-    dma_channel_set_read_addr (s_dma_ch, s_cmd_buf, false);
-    dma_channel_set_trans_count(s_dma_ch, 1 + SSD1306_BUF_SIZE, true);  /* true = trigger */
-    /* returns immediately — task can draw back_buf while DMA runs */
+    /* Build ctrl-byte + pixel-byte array, hand off to the shared sender */
+    static uint8_t frame_bytes[1 + SSD1306_BUF_SIZE];
+    frame_bytes[0] = 0x40u;
+    memcpy(frame_bytes + 1, front_buf, SSD1306_BUF_SIZE);
+    ssd1306_i2c_send_dma(frame_bytes, sizeof(frame_bytes));
 }
 
 /* ── Draw primitives ─────────────────────────────────────────────────────── */
